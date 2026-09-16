@@ -10,7 +10,7 @@ sudo bash airlink-installer.sh
 or as a curl-pipe-bash one-liner once it's hosted somewhere:
 
 ```bash
-curl -fsSL <your-raw-url>/airlink-installer.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Srccodeusr/AirlinkInstallationScript/main/airlink-installer.sh | sudo bash
 ```
 
 That drops you into a menu (uses `whiptail` for a boxed button-style menu if
