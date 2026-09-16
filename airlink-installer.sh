@@ -81,25 +81,6 @@ require_root() {
   fi
 }
 
-# When the script is run as `curl ... | sudo bash`, fd 0 (stdin) is the
-# script's own source text, not the keyboard — so whiptail/read can never
-# see a keypress and every menu looks frozen. Reattach stdin to the real
-# terminal device whenever one is available so interactive prompts work
-# the same whether the script was piped in or run from a local file.
-ensure_interactive_stdin() {
-  if [[ ! -t 0 ]]; then
-    if [[ -r /dev/tty ]] && exec 0</dev/tty 2>/dev/null; then
-      : # stdin is now the real terminal; menus/read will work normally
-    else
-      warn "No terminal available to read input from (stdin isn't a TTY and /dev/tty is unavailable)."
-      warn "This usually means the script is running fully non-interactively (e.g. cron, CI, or a detached pipe)."
-      warn "Re-run it with: sudo bash --action <action> ... (see --headless usage), or download the script first:"
-      warn "  curl -fsSL <raw-url-to-this-file> -o airlink-installer.sh && sudo bash airlink-installer.sh"
-      die "Cannot show the interactive menu without a terminal."
-    fi
-  fi
-}
-
 # ============================================================================
 # Environment detection
 # ============================================================================
@@ -128,42 +109,55 @@ detect_service_manager() {
   # silently fail every enable/start call.
   if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]] && systemctl list-units &>/dev/null; then
     SERVICE_MANAGER="systemd"
-  elif command -v supervisorctl &>/dev/null; then
+  elif command -v supervisorctl &>/dev/null && supervisorctl status &>/dev/null; then
     SERVICE_MANAGER="supervisor"
+  elif command -v supervisorctl &>/dev/null; then
+    # Installed, but the daemon isn't actually answering — very common in
+    # ephemeral containers/dev-sandboxes where a previous background
+    # supervisord got killed when the session/terminal closed.
+    SERVICE_MANAGER="supervisor-down"
   else
     SERVICE_MANAGER="none"
   fi
   echo "$SERVICE_MANAGER"
 }
 
+# Starts (or restarts) the supervisord daemon and waits until supervisorctl
+# can actually talk to it, instead of firing-and-hoping.
+start_supervisord() {
+  mkdir -p /var/log/supervisor /var/run /etc/supervisor/conf.d 2>/dev/null
+  systemctl_or_service_start supervisor 2>/dev/null
+  supervisorctl status &>/dev/null || service supervisor start &>/dev/null
+  if ! supervisorctl status &>/dev/null; then
+    nohup supervisord -c /etc/supervisor/supervisord.conf &>>"$LOG_DIR/supervisord.log" 2>&1 &
+    disown 2>/dev/null
+  fi
+  local tries=0
+  until supervisorctl status &>/dev/null; do
+    tries=$((tries + 1))
+    if [[ $tries -ge 10 ]]; then
+      fail "supervisord still isn't responding after ${tries} attempts — check $LOG_DIR/supervisord.log"
+      return 1
+    fi
+    sleep 0.5
+  done
+  return 0
+}
+
 ensure_service_manager() {
   detect_service_manager >/dev/null
-  if [[ "$SERVICE_MANAGER" == "none" ]]; then
-    warn "No usable service manager detected (no live systemd, no supervisor)."
-    step "Installing supervisor as the process manager (works inside containers/VPS without systemd)..."
-    install_packages supervisor
-
-    mkdir -p /etc/supervisor/conf.d
-    # RHEL-family supervisor packages sometimes use a different default conf
-    # path; make sure conf.d is actually included so our .conf files get read.
-    local main_conf
-    for main_conf in /etc/supervisord.conf /etc/supervisor/supervisord.conf; do
-      [[ -f "$main_conf" ]] && ! grep -q '/etc/supervisor/conf.d' "$main_conf" 2>/dev/null \
-        && echo -e "\n[include]\nfiles = /etc/supervisor/conf.d/*.conf" >> "$main_conf"
-    done
-
-    systemctl_or_service_start supervisor &>/dev/null \
-      || systemctl_or_service_start supervisord &>/dev/null \
-      || service supervisord start &>/dev/null \
-      || (supervisord -c /etc/supervisor/supervisord.conf &>/dev/null &)
-    sleep 1
-
-    if command -v supervisorctl &>/dev/null && supervisorctl status &>/dev/null; then
-      SERVICE_MANAGER="supervisor"
-    else
-      die "Installed supervisor but couldn't get it running — check that it installed correctly and try starting it manually (supervisord)."
-    fi
-  fi
+  case "$SERVICE_MANAGER" in
+    none)
+      warn "No usable service manager detected (no live systemd, no supervisor)."
+      step "Installing supervisor as the process manager (works inside containers/VPS without systemd)..."
+      install_packages supervisor
+      start_supervisord && SERVICE_MANAGER="supervisor"
+      ;;
+    supervisor-down)
+      warn "supervisor is installed but its daemon isn't responding (common after a sandbox/container restart) — restarting it..."
+      start_supervisord && SERVICE_MANAGER="supervisor"
+      ;;
+  esac
   ok "Service manager: ${C_BOLD}${SERVICE_MANAGER}${C_RESET}"
 }
 
@@ -180,19 +174,11 @@ install_packages() {
   case "$PKG_MANAGER" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y >>"$LOG_DIR/apt.log" 2>&1 \
-        || warn "apt-get update failed — continuing with existing package lists (see $LOG_DIR/apt.log)"
-      apt-get install -y "${pkgs[@]}" >>"$LOG_DIR/apt.log" 2>&1 \
-        || die "apt-get install failed for: ${pkgs[*]} — see $LOG_DIR/apt.log"
+      apt-get update -y >>"$LOG_DIR/apt.log" 2>&1
+      apt-get install -y "${pkgs[@]}" >>"$LOG_DIR/apt.log" 2>&1
       ;;
-    dnf)
-      dnf install -y "${pkgs[@]}" >>"$LOG_DIR/dnf.log" 2>&1 \
-        || die "dnf install failed for: ${pkgs[*]} — see $LOG_DIR/dnf.log"
-      ;;
-    yum)
-      yum install -y "${pkgs[@]}" >>"$LOG_DIR/yum.log" 2>&1 \
-        || die "yum install failed for: ${pkgs[*]} — see $LOG_DIR/yum.log"
-      ;;
+    dnf) dnf install -y "${pkgs[@]}" >>"$LOG_DIR/dnf.log" 2>&1 ;;
+    yum) yum install -y "${pkgs[@]}" >>"$LOG_DIR/yum.log" 2>&1 ;;
     *) die "Unsupported package manager. Install manually: ${pkgs[*]}" ;;
   esac
 }
@@ -212,7 +198,6 @@ install_node() {
       curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" | bash - >>"$LOG_DIR/node.log" 2>&1
       install_packages nodejs
       ;;
-    *) die "Cannot install Node.js: unsupported/undetected package manager ('${PKG_MANAGER}')." ;;
   esac
   command -v node &>/dev/null && ok "Node.js $(node -v) installed" || die "Node.js install failed, check $LOG_DIR/node.log"
 }
@@ -223,7 +208,6 @@ install_dependencies() {
     apt)  install_packages curl git build-essential python3 unzip whiptail ufw ;;
     dnf)  install_packages curl git gcc gcc-c++ make python3 unzip newt firewalld ;;
     yum)  install_packages curl git gcc gcc-c++ make python3 unzip newt firewalld ;;
-    *) die "Unsupported/undetected package manager ('${PKG_MANAGER}') — no apt-get, dnf, or yum found. Install curl, git, build tools, python3 manually, then re-run." ;;
   esac
   ok "Base dependencies installed"
   install_node
@@ -234,15 +218,9 @@ open_firewall_port() {
   if command -v ufw &>/dev/null && ufw status &>/dev/null; then
     ufw allow "${port}/tcp" &>/dev/null && ok "Opened port ${port}/tcp (ufw)"
   elif command -v firewall-cmd &>/dev/null; then
-    if ! systemctl is-active --quiet firewalld 2>/dev/null; then
-      systemctl_or_service_start firewalld &>/dev/null
-      sleep 1
-    fi
-    if firewall-cmd --add-port="${port}/tcp" --permanent &>/dev/null && firewall-cmd --reload &>/dev/null; then
-      ok "Opened port ${port}/tcp (firewalld)"
-    else
-      warn "firewalld is installed but couldn't open port ${port} automatically — open it manually with: firewall-cmd --add-port=${port}/tcp --permanent && firewall-cmd --reload"
-    fi
+    firewall-cmd --add-port="${port}/tcp" --permanent &>/dev/null
+    firewall-cmd --reload &>/dev/null
+    ok "Opened port ${port}/tcp (firewalld)"
   else
     warn "No local firewall tool detected — if the panel/dashboard isn't reachable, open port ${port} in your VPS provider's network/firewall settings (and in Pterodactyl's port allocations, if this runs inside a Pterodactyl node)."
   fi
@@ -457,39 +435,22 @@ action_setup_cloudflared() {
       x86_64) cf_arch="amd64" ;;
       aarch64|arm64) cf_arch="arm64" ;;
       armv7l) cf_arch="arm" ;;
-      *) warn "Unrecognized architecture '${arch}', defaulting to amd64 (may not work)." ;;
     esac
-
-    local cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
-    local cf_tmp; cf_tmp="$(mktemp)"
-    local http_code
-    http_code="$(curl -w '%{http_code}' -fsSL -o "$cf_tmp" "$cf_url" 2>>"$LOG_DIR/cloudflared.log")"
-    local curl_rc=$?
-
-    if [[ $curl_rc -ne 0 || "$http_code" != "200" ]]; then
-      rm -f "$cf_tmp"
-      die "cloudflared download failed (curl exit ${curl_rc}, HTTP ${http_code:-none}) from ${cf_url}. See $LOG_DIR/cloudflared.log"
-    fi
-
-    # A failed/redirected download often yields a tiny HTML error page rather
-    # than the ~40MB+ binary. Reject anything implausibly small before
-    # installing it, so a bad download doesn't get treated as a success.
-    local cf_size
-    cf_size="$(stat -c%s "$cf_tmp" 2>/dev/null || stat -f%z "$cf_tmp" 2>/dev/null || echo 0)"
-    if [[ "$cf_size" -lt 1000000 ]]; then
-      rm -f "$cf_tmp"
-      die "cloudflared download looked corrupt (only ${cf_size} bytes). See $LOG_DIR/cloudflared.log and verify network/GitHub access."
-    fi
-
-    install -m 755 "$cf_tmp" /usr/local/bin/cloudflared
-    rm -f "$cf_tmp"
-
-    if ! command -v cloudflared &>/dev/null; then
-      die "cloudflared install failed — /usr/local/bin/cloudflared missing after install. See $LOG_DIR/cloudflared.log"
-    fi
-    if ! cloudflared --version &>>"$LOG_DIR/cloudflared.log"; then
-      die "cloudflared binary was installed but won't run (wrong architecture? bad download?). See $LOG_DIR/cloudflared.log"
-    fi
+    case "$PKG_MANAGER" in
+      apt)
+        curl -fsSL -o /usr/local/bin/cloudflared \
+          "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
+          >>"$LOG_DIR/cloudflared.log" 2>&1
+        chmod +x /usr/local/bin/cloudflared
+        ;;
+      dnf|yum)
+        curl -fsSL -o /usr/local/bin/cloudflared \
+          "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
+          >>"$LOG_DIR/cloudflared.log" 2>&1
+        chmod +x /usr/local/bin/cloudflared
+        ;;
+    esac
+    command -v cloudflared &>/dev/null || die "cloudflared install failed, see $LOG_DIR/cloudflared.log"
     ok "cloudflared installed: $(cloudflared --version 2>/dev/null | head -1)"
   else
     ok "cloudflared already installed"
@@ -671,7 +632,7 @@ white-space:pre-wrap;border:1px solid #232c46}
 .steps{margin:10px 0;font-size:13px}
 .steps div{padding:3px 0;color:var(--muted)}
 .steps .ok{color:var(--good)} .steps .fail{color:var(--bad)} .steps .step{color:var(--accent2)}
-footer{text-align:center;color:var(--muted);font-size:12px;padding:20px 0 40px}
+footer{text-align:center;color:#5b6padding: 20px 0 40px;color:var(--muted);font-size:12px;padding-bottom:30px}
 </style></head>
 <body>
 <header>
@@ -818,9 +779,43 @@ PYEOF
   sed -i "s#__SCRIPT_PATH__#${SCRIPT_PATH}#g; s#__LOG_DIR__#${LOG_DIR}#g; s#__DASHBOARD_PORT__#${DASHBOARD_PORT}#g" "$DASHBOARD_DIR/dashboard.py"
 }
 
+print_dashboard_access_info() {
+  # Cloud dev-sandboxes (Codespaces, CodeSandbox, etc.) don't expose a real
+  # public IP — there is nothing to "port forward" in the VPS sense, so an
+  # IP:PORT link would just be wrong there. Detect those and point at the
+  # platform's own port-forwarding UI instead.
+  if [[ -n "${CODESPACES:-}" || -n "${CODESPACE_NAME:-}" ]]; then
+    ok "Web dashboard is live (GitHub Codespaces detected)."
+    if [[ -n "${CODESPACE_NAME:-}" && -n "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-}" ]]; then
+      echo -e "${C_GREEN}${C_BOLD}  -> Open: https://${CODESPACE_NAME}-${DASHBOARD_PORT}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}${C_RESET}"
+    fi
+    echo -e "${C_DIM}  Codespaces forwards ports itself — there's no IP to forward manually here."
+    echo -e "  If the link above doesn't work yet: open the PORTS tab (bottom panel of"
+    echo -e "  VS Code / the browser editor), find port ${DASHBOARD_PORT} (it auto-appears once"
+    echo -e "  this starts listening, or click 'Add Port' if not), then click the globe icon."
+    echo -e "  It's Private by default (only you, once logged into GitHub); right-click ->"
+    echo -e "  Port Visibility -> Public if you need to share the link with someone else.${C_RESET}"
+  elif [[ -n "${CODESANDBOX_SSE:-}" || -n "${CODESANDBOX_HOST:-}" ]]; then
+    ok "Web dashboard is live (CodeSandbox detected)."
+    echo -e "${C_DIM}  CodeSandbox proxies ports itself as https://<sandbox-id>-${DASHBOARD_PORT}.csb.app —"
+    echo -e "  there's no IP to forward manually here. Open the Ports / Preview panel in the"
+    echo -e "  CodeSandbox UI (DevTools panel) — port ${DASHBOARD_PORT} should appear there once this"
+    echo -e "  starts listening; click it to open the preview, or copy its URL to share it.${C_RESET}"
+  else
+    local ip; ip="$(get_public_ip)"
+    ok "Web dashboard is live."
+    echo -e "${C_GREEN}${C_BOLD}  -> Open: http://${ip}:${DASHBOARD_PORT}${C_RESET}"
+    echo -e "${C_DIM}  If that doesn't load, forward/allow port ${DASHBOARD_PORT} in your VPS provider's"
+    echo -e "  network panel (or Pterodactyl's port allocations if this is a Pterodactyl node), then retry.${C_RESET}"
+  fi
+  echo
+}
+
 launch_dashboard() {
   write_dashboard_assets
-  open_firewall_port "$DASHBOARD_PORT"
+  if [[ -z "${CODESPACES:-}${CODESPACE_NAME:-}${CODESANDBOX_SSE:-}${CODESANDBOX_HOST:-}" ]]; then
+    open_firewall_port "$DASHBOARD_PORT"
+  fi
 
   if pgrep -f "dashboard.py" &>/dev/null; then
     warn "Dashboard already appears to be running."
@@ -830,13 +825,8 @@ launch_dashboard() {
     sleep 1
   fi
 
-  local ip; ip="$(get_public_ip)"
   echo
-  ok "Web dashboard is live."
-  echo -e "${C_GREEN}${C_BOLD}  -> Open: http://${ip}:${DASHBOARD_PORT}${C_RESET}"
-  echo -e "${C_DIM}  If that doesn't load, forward/allow port ${DASHBOARD_PORT} in your VPS provider's"
-  echo -e "  network panel (or Pterodactyl's port allocations if this is a Pterodactyl node), then retry.${C_RESET}"
-  echo
+  print_dashboard_access_info
 }
 
 stop_dashboard() {
@@ -848,7 +838,7 @@ stop_dashboard() {
 # ============================================================================
 interactive_menu() {
   while true; do
-    if command -v whiptail &>/dev/null && [[ -t 0 && -t 1 && -n "${TERM:-}" ]]; then
+    if command -v whiptail &>/dev/null; then
       CHOICE=$(whiptail --title "Airlink Installation One Click Script — by prime.dev1" \
         --menu "Choose an action:" 20 74 11 \
         "1" "Install Panel" \
@@ -941,7 +931,6 @@ main() {
 
   clear
   banner
-  ensure_interactive_stdin
   interactive_menu
 }
 
