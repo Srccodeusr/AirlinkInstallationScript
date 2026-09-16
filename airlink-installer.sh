@@ -81,6 +81,25 @@ require_root() {
   fi
 }
 
+# When the script is run as `curl ... | sudo bash`, fd 0 (stdin) is the
+# script's own source text, not the keyboard — so whiptail/read can never
+# see a keypress and every menu looks frozen. Reattach stdin to the real
+# terminal device whenever one is available so interactive prompts work
+# the same whether the script was piped in or run from a local file.
+ensure_interactive_stdin() {
+  if [[ ! -t 0 ]]; then
+    if [[ -r /dev/tty ]] && exec 0</dev/tty 2>/dev/null; then
+      : # stdin is now the real terminal; menus/read will work normally
+    else
+      warn "No terminal available to read input from (stdin isn't a TTY and /dev/tty is unavailable)."
+      warn "This usually means the script is running fully non-interactively (e.g. cron, CI, or a detached pipe)."
+      warn "Re-run it with: sudo bash --action <action> ... (see --headless usage), or download the script first:"
+      warn "  curl -fsSL <raw-url-to-this-file> -o airlink-installer.sh && sudo bash airlink-installer.sh"
+      die "Cannot show the interactive menu without a terminal."
+    fi
+  fi
+}
+
 # ============================================================================
 # Environment detection
 # ============================================================================
@@ -829,7 +848,7 @@ stop_dashboard() {
 # ============================================================================
 interactive_menu() {
   while true; do
-    if command -v whiptail &>/dev/null; then
+    if command -v whiptail &>/dev/null && [[ -t 0 && -t 1 && -n "${TERM:-}" ]]; then
       CHOICE=$(whiptail --title "Airlink Installation One Click Script — by prime.dev1" \
         --menu "Choose an action:" 20 74 11 \
         "1" "Install Panel" \
@@ -922,6 +941,7 @@ main() {
 
   clear
   banner
+  ensure_interactive_stdin
   interactive_menu
 }
 
