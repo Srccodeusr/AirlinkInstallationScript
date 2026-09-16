@@ -52,8 +52,7 @@ I don't have access to your Airlink codebase's internal CLI, so I built
 these two actions to be safe-but-generic and flagged where to adjust:
 
 1. **`action_add_node()`** — assumes the panel gives you a full shell
-   command to paste (matching how you described Cloudflared already
-   working: "paste token as full command or bare token"). If it instead
+   command to paste . If it instead
    hands out a bare token, edit the `NODE_FALLBACK_TEMPLATE` variable near
    the top of that function to match your panel's real node-agent install
    syntax.
