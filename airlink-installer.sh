@@ -123,11 +123,27 @@ ensure_service_manager() {
     warn "No usable service manager detected (no live systemd, no supervisor)."
     step "Installing supervisor as the process manager (works inside containers/VPS without systemd)..."
     install_packages supervisor
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-      mkdir -p /etc/supervisor/conf.d
-      systemctl_or_service_start supervisor 2>/dev/null || service supervisor start 2>/dev/null || supervisord -c /etc/supervisor/supervisord.conf &>/dev/null &
+
+    mkdir -p /etc/supervisor/conf.d
+    # RHEL-family supervisor packages sometimes use a different default conf
+    # path; make sure conf.d is actually included so our .conf files get read.
+    local main_conf
+    for main_conf in /etc/supervisord.conf /etc/supervisor/supervisord.conf; do
+      [[ -f "$main_conf" ]] && ! grep -q '/etc/supervisor/conf.d' "$main_conf" 2>/dev/null \
+        && echo -e "\n[include]\nfiles = /etc/supervisor/conf.d/*.conf" >> "$main_conf"
+    done
+
+    systemctl_or_service_start supervisor &>/dev/null \
+      || systemctl_or_service_start supervisord &>/dev/null \
+      || service supervisord start &>/dev/null \
+      || (supervisord -c /etc/supervisor/supervisord.conf &>/dev/null &)
+    sleep 1
+
+    if command -v supervisorctl &>/dev/null && supervisorctl status &>/dev/null; then
+      SERVICE_MANAGER="supervisor"
+    else
+      die "Installed supervisor but couldn't get it running — check that it installed correctly and try starting it manually (supervisord)."
     fi
-    SERVICE_MANAGER="supervisor"
   fi
   ok "Service manager: ${C_BOLD}${SERVICE_MANAGER}${C_RESET}"
 }
@@ -145,11 +161,19 @@ install_packages() {
   case "$PKG_MANAGER" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y >>"$LOG_DIR/apt.log" 2>&1
-      apt-get install -y "${pkgs[@]}" >>"$LOG_DIR/apt.log" 2>&1
+      apt-get update -y >>"$LOG_DIR/apt.log" 2>&1 \
+        || warn "apt-get update failed — continuing with existing package lists (see $LOG_DIR/apt.log)"
+      apt-get install -y "${pkgs[@]}" >>"$LOG_DIR/apt.log" 2>&1 \
+        || die "apt-get install failed for: ${pkgs[*]} — see $LOG_DIR/apt.log"
       ;;
-    dnf) dnf install -y "${pkgs[@]}" >>"$LOG_DIR/dnf.log" 2>&1 ;;
-    yum) yum install -y "${pkgs[@]}" >>"$LOG_DIR/yum.log" 2>&1 ;;
+    dnf)
+      dnf install -y "${pkgs[@]}" >>"$LOG_DIR/dnf.log" 2>&1 \
+        || die "dnf install failed for: ${pkgs[*]} — see $LOG_DIR/dnf.log"
+      ;;
+    yum)
+      yum install -y "${pkgs[@]}" >>"$LOG_DIR/yum.log" 2>&1 \
+        || die "yum install failed for: ${pkgs[*]} — see $LOG_DIR/yum.log"
+      ;;
     *) die "Unsupported package manager. Install manually: ${pkgs[*]}" ;;
   esac
 }
@@ -169,6 +193,7 @@ install_node() {
       curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" | bash - >>"$LOG_DIR/node.log" 2>&1
       install_packages nodejs
       ;;
+    *) die "Cannot install Node.js: unsupported/undetected package manager ('${PKG_MANAGER}')." ;;
   esac
   command -v node &>/dev/null && ok "Node.js $(node -v) installed" || die "Node.js install failed, check $LOG_DIR/node.log"
 }
@@ -179,6 +204,7 @@ install_dependencies() {
     apt)  install_packages curl git build-essential python3 unzip whiptail ufw ;;
     dnf)  install_packages curl git gcc gcc-c++ make python3 unzip newt firewalld ;;
     yum)  install_packages curl git gcc gcc-c++ make python3 unzip newt firewalld ;;
+    *) die "Unsupported/undetected package manager ('${PKG_MANAGER}') — no apt-get, dnf, or yum found. Install curl, git, build tools, python3 manually, then re-run." ;;
   esac
   ok "Base dependencies installed"
   install_node
@@ -189,9 +215,15 @@ open_firewall_port() {
   if command -v ufw &>/dev/null && ufw status &>/dev/null; then
     ufw allow "${port}/tcp" &>/dev/null && ok "Opened port ${port}/tcp (ufw)"
   elif command -v firewall-cmd &>/dev/null; then
-    firewall-cmd --add-port="${port}/tcp" --permanent &>/dev/null
-    firewall-cmd --reload &>/dev/null
-    ok "Opened port ${port}/tcp (firewalld)"
+    if ! systemctl is-active --quiet firewalld 2>/dev/null; then
+      systemctl_or_service_start firewalld &>/dev/null
+      sleep 1
+    fi
+    if firewall-cmd --add-port="${port}/tcp" --permanent &>/dev/null && firewall-cmd --reload &>/dev/null; then
+      ok "Opened port ${port}/tcp (firewalld)"
+    else
+      warn "firewalld is installed but couldn't open port ${port} automatically — open it manually with: firewall-cmd --add-port=${port}/tcp --permanent && firewall-cmd --reload"
+    fi
   else
     warn "No local firewall tool detected — if the panel/dashboard isn't reachable, open port ${port} in your VPS provider's network/firewall settings (and in Pterodactyl's port allocations, if this runs inside a Pterodactyl node)."
   fi
@@ -406,22 +438,39 @@ action_setup_cloudflared() {
       x86_64) cf_arch="amd64" ;;
       aarch64|arm64) cf_arch="arm64" ;;
       armv7l) cf_arch="arm" ;;
+      *) warn "Unrecognized architecture '${arch}', defaulting to amd64 (may not work)." ;;
     esac
-    case "$PKG_MANAGER" in
-      apt)
-        curl -fsSL -o /usr/local/bin/cloudflared \
-          "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
-          >>"$LOG_DIR/cloudflared.log" 2>&1
-        chmod +x /usr/local/bin/cloudflared
-        ;;
-      dnf|yum)
-        curl -fsSL -o /usr/local/bin/cloudflared \
-          "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
-          >>"$LOG_DIR/cloudflared.log" 2>&1
-        chmod +x /usr/local/bin/cloudflared
-        ;;
-    esac
-    command -v cloudflared &>/dev/null || die "cloudflared install failed, see $LOG_DIR/cloudflared.log"
+
+    local cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
+    local cf_tmp; cf_tmp="$(mktemp)"
+    local http_code
+    http_code="$(curl -w '%{http_code}' -fsSL -o "$cf_tmp" "$cf_url" 2>>"$LOG_DIR/cloudflared.log")"
+    local curl_rc=$?
+
+    if [[ $curl_rc -ne 0 || "$http_code" != "200" ]]; then
+      rm -f "$cf_tmp"
+      die "cloudflared download failed (curl exit ${curl_rc}, HTTP ${http_code:-none}) from ${cf_url}. See $LOG_DIR/cloudflared.log"
+    fi
+
+    # A failed/redirected download often yields a tiny HTML error page rather
+    # than the ~40MB+ binary. Reject anything implausibly small before
+    # installing it, so a bad download doesn't get treated as a success.
+    local cf_size
+    cf_size="$(stat -c%s "$cf_tmp" 2>/dev/null || stat -f%z "$cf_tmp" 2>/dev/null || echo 0)"
+    if [[ "$cf_size" -lt 1000000 ]]; then
+      rm -f "$cf_tmp"
+      die "cloudflared download looked corrupt (only ${cf_size} bytes). See $LOG_DIR/cloudflared.log and verify network/GitHub access."
+    fi
+
+    install -m 755 "$cf_tmp" /usr/local/bin/cloudflared
+    rm -f "$cf_tmp"
+
+    if ! command -v cloudflared &>/dev/null; then
+      die "cloudflared install failed — /usr/local/bin/cloudflared missing after install. See $LOG_DIR/cloudflared.log"
+    fi
+    if ! cloudflared --version &>>"$LOG_DIR/cloudflared.log"; then
+      die "cloudflared binary was installed but won't run (wrong architecture? bad download?). See $LOG_DIR/cloudflared.log"
+    fi
     ok "cloudflared installed: $(cloudflared --version 2>/dev/null | head -1)"
   else
     ok "cloudflared already installed"
@@ -603,7 +652,7 @@ white-space:pre-wrap;border:1px solid #232c46}
 .steps{margin:10px 0;font-size:13px}
 .steps div{padding:3px 0;color:var(--muted)}
 .steps .ok{color:var(--good)} .steps .fail{color:var(--bad)} .steps .step{color:var(--accent2)}
-footer{text-align:center;color:#5b6padding: 20px 0 40px;color:var(--muted);font-size:12px;padding-bottom:30px}
+footer{text-align:center;color:var(--muted);font-size:12px;padding:20px 0 40px}
 </style></head>
 <body>
 <header>
