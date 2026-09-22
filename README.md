@@ -1,79 +1,56 @@
-# Airlink Installation One Click Script
-*by prime.dev1*
+# Airlink Panel Executor
 
-## Run it
+An interactive bash menu for installing, running, and managing [Airlink Panel](https://github.com/AirlinkLabs/panel) on any VPS or container.
 
-```bash
-sudo bash airlink-installer.sh
-```
+Made by **prime.dev1**
 
-or as a curl-pipe-bash one-liner once it's hosted somewhere:
+## Requirements
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Srccodeusr/AirlinkInstallationScript/main/airlink-installer.sh | sudo bash
-```
+- Linux with one of: `apt`, `dnf`, `yum`, `apk`, `pacman`
+- Root, or a user with `sudo` — the script still runs without either, but system-level package installs will be skipped
+- Internet access (to pull Node.js, pnpm, the Airlink repo, and optionally cloudflared)
 
-That drops you into a menu (uses `whiptail` for a boxed button-style menu if
-available, plain numbered menu otherwise): Install Panel, Update Panel, Add
-Node, Connect Cloudflared, Admin User Setup, service status/restart, and
-**Launch Web Dashboard** — which starts a local browser GUI.
-
-## The web GUI
-
-Choosing "Launch Web Dashboard" starts a small built-in web server (Python
-stdlib only, no extra installs) and prints a URL like:
-
-```
-http://YOUR_SERVER_IP:7100
-```
-
-Open that in a browser. It's a dark, modern dashboard with a button per
-action; clicking one pops a modal (with input fields where needed — e.g.
-pasting the node command or Cloudflare token), runs the real script on the
-VPS in the background, and streams the live log with a parsed step list
-until it finishes. It tries to open the port automatically via `ufw` /
-`firewalld`; if that's not available in your environment (common inside
-sandboxed containers), open/forward the port yourself in your VPS
-provider's network panel (or Pterodactyl's port allocations, if this runs
-inside a Pterodactyl-hosted node).
-
-## What it auto-detects
-
-- **Package manager**: apt / dnf / yum.
-- **Service manager**: uses `systemd` only if it's actually live (checks for
-  a real `/run/systemd/system` and a responsive `systemctl`), otherwise
-  falls back to `supervisor` — installing it if missing. This is what makes
-  it work unmodified both on a normal VPS and inside a systemd-less
-  sandbox/container.
-
-## Two spots you'll likely want to tune for your exact fork
-
-I don't have access to your Airlink codebase's internal CLI, so I built
-these two actions to be safe-but-generic and flagged where to adjust:
-
-1. **`action_add_node()`** — assumes the panel gives you a full shell
-   command to paste . If it instead
-   hands out a bare token, edit the `NODE_FALLBACK_TEMPLATE` variable near
-   the top of that function to match your panel's real node-agent install
-   syntax.
-2. **`action_admin_setup()`** — writes `ADMIN_USERNAME` / `ADMIN_EMAIL` /
-   `ADMIN_PASSWORD` into `.env`, then looks for an npm script named
-   `seed:admin` or `seed` in `package.json` and runs it. If your fork uses a
-   different bootstrap command (or a one-off CLI script) to actually create
-   the admin row in the DB, swap that in.
-
-Everything else (install, update, service registration, Cloudflared,
-dashboard) should work as-is against a standard Node.js app with `start`
-(or `dev`) in `package.json`.
-
-## Config
-
-All the defaults are overridable via env vars before running, e.g.:
+## Usage
 
 ```bash
-AIRLINK_INSTALL_DIR=/opt/airlink \
-AIRLINK_REPO_URL=https://github.com/Srccodeusr/Aetherpanel-only-frontend-Made-by-Zensei-.git \
-AIRLINK_PANEL_PORT=3000 \
-AIRLINK_DASHBOARD_PORT=7100 \
-sudo -E bash airlink-installer.sh
+chmod +x airlink-executor.sh
+sudo ./airlink-executor.sh
 ```
+
+You'll land on a numbered menu. Re-run the script any time — it remembers your panel directory and port in `~/.airlink-executor.conf`.
+
+## Menu options
+
+| # | Option | What it does |
+|---|--------|---------------|
+| 1 | Install Panel | Installs Node.js 18+, pnpm, git and build tools; clones `AirlinkLabs/panel`; prompts for port, public URL, and database; generates a session secret; runs migrations; builds the panel |
+| 2 | Run Panel (Production) | Builds the panel and starts it as a managed background service |
+| 3 | Run Panel (Development) | Runs the panel in the foreground with `NODE_ENV=development` (Ctrl+C to stop) |
+| 4 | Update Panel | `git pull`, reinstalls dependencies, re-runs migrations, rebuilds, restarts the service |
+| 5 | Connect Cloudflared | Installs `cloudflared` if missing, then sets up a quick tunnel (instant temp URL) or a named tunnel (your own token) |
+| 6 | Create Admin User | See [Admin user](#admin-user) below |
+| 7 | Configure External MySQL | Prompts for host/port/user/password/database and writes `DATABASE_URL` into `.env` |
+| 8 | Service Status | Shows whether the panel is running, using whichever process manager was detected |
+| 9 | Restart Service | Restarts the panel |
+| 10 | Stop Service | Stops the panel |
+| 11 | View Logs | Tails the panel's logs |
+| 12 | Open Firewall Port | Opens the configured port via `ufw` or `firewalld` |
+
+## Environment detection
+
+On startup, the script checks — in order — for **systemd**, then **supervisor**, then **pm2**. If none of those are present (common in CodeSandbox, GitHub Codespaces, and other bare containers), it automatically installs pm2 as a universal fallback so the panel still survives as a managed background process. If pm2 can't be installed either (no permissions), it falls back to a plain `nohup` background process.
+
+Package management is auto-detected across `apt`, `dnf`, `yum`, `apk`, and `pacman`, so the same script works on Debian/Ubuntu, Fedora/RHEL/CentOS, Alpine, and Arch-based hosts.
+
+## Database
+
+- Default: local SQLite (`file:./storage/database.db`) — simplest option, good for testing or small setups.
+- External MySQL can be configured at install time, any time from the menu (option 7), or the script will offer it automatically if a migration fails.
+
+## Admin user
+
+Airlink has no CLI command for creating an admin. Instead, **the first account registered through the web UI is automatically made admin.** Option 6 checks `package.json` for an admin-related script (in case a future version adds one) and runs it if found; otherwise it just points you to the panel's URL to register that first account.
+
+## Credits
+
+Airlink Panel installer executor — made by **prime.dev1**.
